@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# tasks — tiny shared todo list for the human (bar widget) and agents (this CLI).
+#
+#   tasks add <text...> [--by NAME]   add a task, prints its id   (NAME defaults to $TASKS_BY or "human")
+#   tasks ls [--json] [--open]        list tasks (--open hides completed)
+#   tasks done <id>... | undo <id>... | toggle <id>... | rm <id>...
+#   tasks clear [--all]               drop completed tasks (or everything with --all)
+#   tasks path                        print the backing file
+#   tasks config [ephemeral true|false]
+#                                     show or set options (ephemeral = list lives
+#                                     only for the desktop session)
+#
+# The JSON file is the whole interface: [{id, text, done, by, created, doneAt}].
+# Every write goes through this script under flock, and is written in place so
+# the bar widget's file watch keeps firing. Readers that want a consistent view
+# should use `tasks ls --json` rather than cat-ing the file.
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/tasks/config"
+
+# key=value lines; read with grep, never sourced
+config_get() {
+  [[ -f $CONFIG ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n1 | tr -d '[:space:]'
+}
+
+is_true() { [[ ${1,,} =~ ^(1|true|yes|on)$ ]]; }
+
+# Where the list lives. Precedence: $TASKS_FILE, then $TASKS_EPHEMERAL, then the
+# config file. Persistent (default): ~/.local/state, survives logout and reboot.
+# Ephemeral: $XDG_RUNTIME_DIR, which is wiped when your login session ends.
+EPHEMERAL=${TASKS_EPHEMERAL:-$(config_get ephemeral)}
+if [[ -n ${TASKS_FILE:-} ]]; then
+  FILE=$TASKS_FILE
+elif is_true "${EPHEMERAL:-false}" && [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  FILE="$XDG_RUNTIME_DIR/tasks/tasks.json"
+else
+  FILE="${XDG_STATE_HOME:-$HOME/.local/state}/tasks/tasks.json"
+fi
+LOCK="$FILE.lock"
+
+die() { echo "tasks: $*" >&2; exit 1; }
+
+# open the lock on fd 9 (creating the data dir first) and take it: lock -x | lock -s
+lock() {
+  mkdir -p "$(dirname "$FILE")"
+  exec 9>"$LOCK"
+  flock "$1" 9
+}
+
+init() {
+  [[ -s $FILE ]] || echo '[]' >"$FILE"
+}
+
+# Run a jq filter against the file under an exclusive lock and write the result back in place.
+mutate() {
+  local out
+  lock -x
+  init
+  out=$(jq "$@" "$FILE") || die "update failed"
+  printf '%s\n' "$out" >"$FILE"
+  exec 9>&-
+}
+
+read_json() {
+  lock -s
+  init
+  cat "$FILE"
+  exec 9>&-
+}
+
+check_ids() {
+  (($#)) || die "need at least one id"
+  local id
+  for id in "$@"; do [[ $id =~ ^[0-9]+$ ]] || die "bad id: $id"; done
+}
+
+ids_json() { printf '%s\n' "$@" | jq -s 'map(tonumber)'; }
+
+cmd=${1:-ls}
+shift || true
+
+case $cmd in
+  add)
+    by=${TASKS_BY:-human}
+    words=()
+    while (($#)); do
+      case $1 in
+        --by) by=${2:?--by needs a name}; shift 2 ;;
+        --by=*) by=${1#--by=}; shift ;;
+        *) words+=("$1"); shift ;;
+      esac
+    done
+    text="${words[*]:-}"
+    text="${text#"${text%%[![:space:]]*}"}"
+    [[ -n $text ]] || die "empty task"
+    lock -x
+    init
+    # ids are never reused (a cleared id must not alias a new task an agent sees)
+    seq_file="$FILE.seq"
+    last=$(cat "$seq_file" 2>/dev/null || echo 0)
+    id=$(jq --argjson last "${last:-0}" '[(map(.id) | max // 0), $last] | max + 1' "$FILE")
+    echo "$id" >"$seq_file"
+    out=$(jq --argjson id "$id" --arg text "$text" --arg by "$by" --arg now "$(date -Iseconds)" \
+      '. + [{id: $id, text: $text, done: false, by: $by, created: $now, doneAt: null}]' "$FILE")
+    printf '%s\n' "$out" >"$FILE"
+    exec 9>&-
+    echo "$id"
+    ;;
+  done | undo | toggle)
+    check_ids "$@"
+    case $cmd in
+      done) expr='true' ;;
+      undo) expr='false' ;;
+      toggle) expr='(.done | not)' ;;
+    esac
+    mutate --argjson ids "$(ids_json "$@")" --arg now "$(date -Iseconds)" \
+      "map(if (.id as \$i | \$ids | index(\$i)) then (.done = $expr | .doneAt = (if .done then \$now else null end)) else . end)"
+    ;;
+  rm)
+    check_ids "$@"
+    mutate --argjson ids "$(ids_json "$@")" 'map(select(.id as $i | $ids | index($i) | not))'
+    ;;
+  clear)
+    if [[ ${1:-} == --all ]]; then mutate '[]'; else mutate 'map(select(.done | not))'; fi
+    ;;
+  ls | list)
+    json=0 open=0
+    for a in "$@"; do
+      case $a in
+        --json) json=1 ;;
+        --open) open=1 ;;
+        *) die "unknown flag: $a" ;;
+      esac
+    done
+    data=$(read_json)
+    ((open)) && data=$(jq 'map(select(.done | not))' <<<"$data")
+    if ((json)); then
+      printf '%s\n' "$data"
+    else
+      jq -r '.[] | "\(.id)\t[\(if .done then "x" else " " end)] \(.text)\(if .by != "human" then "  (\(.by))" else "" end)"' <<<"$data"
+    fi
+    ;;
+  path) echo "$FILE" ;;
+  config)
+    if (($# == 0)); then
+      echo "ephemeral=$(is_true "${EPHEMERAL:-false}" && echo true || echo false)"
+      echo "file=$FILE"
+      exit 0
+    fi
+    [[ $1 == ephemeral ]] || die "unknown option: $1 (known: ephemeral)"
+    case ${2:-} in
+      true | false) ;;
+      *) die "usage: tasks config ephemeral true|false" ;;
+    esac
+    mkdir -p "$(dirname "$CONFIG")"
+    touch "$CONFIG"
+    grep -v '^[[:space:]]*ephemeral[[:space:]]*=' "$CONFIG" >"$CONFIG.tmp" || true
+    echo "ephemeral=$2" >>"$CONFIG.tmp"
+    old=$FILE
+    mv "$CONFIG.tmp" "$CONFIG"
+    # rewrite the old list in place so a watching bar widget refreshes and
+    # notices the new location
+    if [[ -f $old ]]; then
+      lock -x
+      printf '%s\n' "$(cat "$old")" >"$old"
+      exec 9>&-
+    fi
+    echo "ephemeral=$2 (list now at $("$0" path))"
+    ;;
+  -h | --help | help) sed -n '2,/^set /{/^#/s/^# \{0,1\}//p}' "$0" ;;
+  *) die "unknown command: $cmd (try: tasks help)" ;;
+esac

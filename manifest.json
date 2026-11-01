@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "derrekito.tasks",
+  "name": "Tasks",
+  "version": "1.0.0",
+  "author": "derrekito",
+  "license": "MIT",
+  "description": "Shared todo list for you and your agents. Agents use the `tasks` CLI; the bar panel shows the same list live.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tasks",
+    "description": "Checklist panel: add with +, tick to complete, clear completed.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
