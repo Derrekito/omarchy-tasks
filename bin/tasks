@@ -3,14 +3,19 @@
 #
 #   tasks add <text...> [--by NAME]   add a task, prints its id   (NAME defaults to $TASKS_BY or "human")
 #   tasks ls [--json] [--open]        list tasks (--open hides completed)
-#   tasks done <id>... | undo <id>... | toggle <id>... | rm <id>...
+#   tasks start <id>... [--by NAME]   mark in progress ("doing"), claimed by NAME
+#   tasks done <id>... | undo <id>... back to todo | rm <id>...
+#   tasks move <id>... <todo|doing|done> [--by NAME]
+#   tasks next <id>... | prev <id>... step one column right / left
+#   tasks toggle <id>...              done <-> todo
 #   tasks clear [--all]               drop completed tasks (or everything with --all)
 #   tasks path                        print the backing file
-#   tasks config [ephemeral true|false]
-#                                     show or set options (ephemeral = list lives
-#                                     only for the desktop session)
+#   tasks config [<key> <value>]      show or set options:
+#                                       ephemeral true|false  list lives only for the desktop session
+#                                       view list|kanban      how the bar panel shows tasks
 #
-# The JSON file is the whole interface: [{id, text, done, by, created, doneAt}].
+# The JSON file is the whole interface: [{id, text, status, done, by, created,
+# startedBy, startedAt, doneAt}], status = todo | doing | done (done mirrors it).
 # Every write goes through this script under flock, and is written in place so
 # the bar widget's file watch keeps firing. Readers that want a consistent view
 # should use `tasks ls --json` rather than cat-ing the file.
@@ -38,6 +43,9 @@ else
   FILE="${XDG_STATE_HOME:-$HOME/.local/state}/tasks/tasks.json"
 fi
 LOCK="$FILE.lock"
+
+VIEW=${TASKS_VIEW:-$(config_get view)}
+[[ $VIEW == kanban ]] || VIEW=list
 
 die() { echo "tasks: $*" >&2; exit 1; }
 
@@ -69,6 +77,54 @@ read_json() {
   exec 9>&-
 }
 
+# jq prelude: normalize old records (done-only) and set a status consistently
+JQ_DEFS='
+def norm: map(.status = (.status // (if .done then "done" else "todo" end)) | .done = (.status == "done"));
+def setst($s; $by; $now):
+  .status = $s | .done = ($s == "done")
+  | .doneAt = (if $s == "done" then (.doneAt // $now) else null end)
+  | if $s == "doing" then .startedBy = $by | .startedAt = $now
+    elif $s == "todo" then .startedBy = null | .startedAt = null
+    else . end;
+def pick($ids): .id as $i | $ids | index($i);
+'
+
+# set status on ids: set_status <status|next|prev|toggle> <by> <id>...
+set_status() {
+  local target=$1 by=$2
+  shift 2
+  check_ids "$@"
+  mutate --argjson ids "$(ids_json "$@")" --arg t "$target" --arg by "$by" --arg now "$(date -Iseconds)" "$JQ_DEFS"'
+    norm | map(if pick($ids) then
+      (if $t == "next" then ({todo: "doing", doing: "done", done: "done"}[.status])
+       elif $t == "prev" then ({todo: "todo", doing: "todo", done: "doing"}[.status])
+       elif $t == "toggle" then (if .status == "done" then "todo" else "done" end)
+       else $t end) as $s
+      | if $s == .status then . else setst($s; $by; $now) end
+    else . end)'
+}
+
+# split "--by NAME" out of an argument list into BY and ARGS
+parse_by() {
+  BY=${TASKS_BY:-human}
+  ARGS=()
+  while (($#)); do
+    case $1 in
+      --by) BY=${2:?--by needs a name}; shift 2 ;;
+      --by=*) BY=${1#--by=}; shift ;;
+      *) ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+touch_list() {
+  # rewrite the list in place so a watching bar widget refreshes
+  [[ -f $1 ]] || return 0
+  lock -x
+  printf '%s\n' "$(cat "$1")" >"$1"
+  exec 9>&-
+}
+
 check_ids() {
   (($#)) || die "need at least one id"
   local id
@@ -82,16 +138,9 @@ shift || true
 
 case $cmd in
   add)
-    by=${TASKS_BY:-human}
-    words=()
-    while (($#)); do
-      case $1 in
-        --by) by=${2:?--by needs a name}; shift 2 ;;
-        --by=*) by=${1#--by=}; shift ;;
-        *) words+=("$1"); shift ;;
-      esac
-    done
-    text="${words[*]:-}"
+    parse_by "$@"
+    by=$BY
+    text="${ARGS[*]:-}"
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n $text ]] || die "empty task"
     lock -x
@@ -102,27 +151,35 @@ case $cmd in
     id=$(jq --argjson last "${last:-0}" '[(map(.id) | max // 0), $last] | max + 1' "$FILE")
     echo "$id" >"$seq_file"
     out=$(jq --argjson id "$id" --arg text "$text" --arg by "$by" --arg now "$(date -Iseconds)" \
-      '. + [{id: $id, text: $text, done: false, by: $by, created: $now, doneAt: null}]' "$FILE")
+      '. + [{id: $id, text: $text, status: "todo", done: false, by: $by, created: $now,
+             startedBy: null, startedAt: null, doneAt: null}]' "$FILE")
     printf '%s\n' "$out" >"$FILE"
     exec 9>&-
     echo "$id"
     ;;
-  done | undo | toggle)
-    check_ids "$@"
+  done | undo | toggle | start | next | prev)
+    parse_by "$@"
     case $cmd in
-      done) expr='true' ;;
-      undo) expr='false' ;;
-      toggle) expr='(.done | not)' ;;
+      done) st=done ;;
+      undo) st=todo ;;
+      start) st=doing ;;
+      *) st=$cmd ;;
     esac
-    mutate --argjson ids "$(ids_json "$@")" --arg now "$(date -Iseconds)" \
-      "map(if (.id as \$i | \$ids | index(\$i)) then (.done = $expr | .doneAt = (if .done then \$now else null end)) else . end)"
+    set_status "$st" "$BY" "${ARGS[@]}"
+    ;;
+  move)
+    parse_by "$@"
+    (( ${#ARGS[@]} >= 2 )) || die "usage: tasks move <id>... <todo|doing|done>"
+    st=${ARGS[-1]}
+    [[ $st =~ ^(todo|doing|done)$ ]] || die "bad status: $st (todo|doing|done)"
+    set_status "$st" "$BY" "${ARGS[@]:0:${#ARGS[@]}-1}"
     ;;
   rm)
     check_ids "$@"
     mutate --argjson ids "$(ids_json "$@")" 'map(select(.id as $i | $ids | index($i) | not))'
     ;;
   clear)
-    if [[ ${1:-} == --all ]]; then mutate '[]'; else mutate 'map(select(.done | not))'; fi
+    if [[ ${1:-} == --all ]]; then mutate '[]'; else mutate "$JQ_DEFS"'norm | map(select(.status != "done"))'; fi
     ;;
   ls | list)
     json=0 open=0
@@ -133,40 +190,45 @@ case $cmd in
         *) die "unknown flag: $a" ;;
       esac
     done
-    data=$(read_json)
-    ((open)) && data=$(jq 'map(select(.done | not))' <<<"$data")
+    data=$(jq "$JQ_DEFS"'norm' <<<"$(read_json)")
+    ((open)) && data=$(jq 'map(select(.status != "done"))' <<<"$data")
     if ((json)); then
       printf '%s\n' "$data"
     else
-      jq -r '.[] | "\(.id)\t[\(if .done then "x" else " " end)] \(.text)\(if .by != "human" then "  (\(.by))" else "" end)"' <<<"$data"
+      jq -r '.[] | "\(.id)\t[\({todo: " ", doing: "~", done: "x"}[.status])] \(.text)"
+        + (if .by != "human" then "  (\(.by))" else "" end)
+        + (if .status == "doing" and .startedBy then "  [doing: \(.startedBy)]" else "" end)' <<<"$data"
     fi
     ;;
   path) echo "$FILE" ;;
   config)
     if (($# == 0)); then
       echo "ephemeral=$(is_true "${EPHEMERAL:-false}" && echo true || echo false)"
+      echo "view=$VIEW"
       echo "file=$FILE"
       exit 0
     fi
-    [[ $1 == ephemeral ]] || die "unknown option: $1 (known: ephemeral)"
-    case ${2:-} in
-      true | false) ;;
-      *) die "usage: tasks config ephemeral true|false" ;;
+    key=$1 val=${2:-}
+    case $key in
+      ephemeral) [[ $val =~ ^(true|false)$ ]] || die "usage: tasks config ephemeral true|false" ;;
+      view) [[ $val =~ ^(list|kanban)$ ]] || die "usage: tasks config view list|kanban" ;;
+      *) die "unknown option: $key (known: ephemeral, view)" ;;
     esac
     mkdir -p "$(dirname "$CONFIG")"
     touch "$CONFIG"
-    grep -v '^[[:space:]]*ephemeral[[:space:]]*=' "$CONFIG" >"$CONFIG.tmp" || true
-    echo "ephemeral=$2" >>"$CONFIG.tmp"
-    old=$FILE
+    grep -v "^[[:space:]]*$key[[:space:]]*=" "$CONFIG" >"$CONFIG.tmp" || true
+    echo "$key=$val" >>"$CONFIG.tmp"
     mv "$CONFIG.tmp" "$CONFIG"
-    # rewrite the old list in place so a watching bar widget refreshes and
-    # notices the new location
-    if [[ -f $old ]]; then
-      lock -x
-      printf '%s\n' "$(cat "$old")" >"$old"
-      exec 9>&-
-    fi
-    echo "ephemeral=$2 (list now at $("$0" path))"
+    touch_list "$FILE" # the widget watches the list it is showing; nudge it
+    echo "$key=$val"
+    [[ $key == ephemeral ]] && echo "list now at $("$0" path)"
+    exit 0
+    ;;
+  # for the bar widget: path, view, then the list as JSON, in one process
+  _widget)
+    echo "$FILE"
+    echo "$VIEW"
+    jq "$JQ_DEFS"'norm' <<<"$(read_json)"
     ;;
   -h | --help | help) sed -n '2,/^set /{/^#/s/^# \{0,1\}//p}' "$0" ;;
   *) die "unknown command: $cmd (try: tasks help)" ;;

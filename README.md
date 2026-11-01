@@ -11,8 +11,12 @@ and changes show up live.
 - Type a task and press **+** or Enter. Click a task to tick it off, hover to get
   an × that deletes it, and use **Clear completed** to tidy up.
 - The bar icon shows how many tasks are still open.
+- Optional **kanban view**: Todo / Doing / Done columns. Click a card to move it
+  right, right-click to move it back.
 - Agents (Claude Code, Codex, opencode, Grok, scripts, anything with a shell) use
   the `tasks` CLI. Tasks they add are tagged with their name, e.g. `· claude`.
+
+![The kanban view](docs/kanban.png)
 
 ## Install
 
@@ -34,19 +38,41 @@ omarchy bar move derrekito.tasks --before omarchy.bluetooth
 ```
 tasks add <text...> [--by NAME]   add a task, prints its id (NAME defaults to $TASKS_BY or "human")
 tasks ls [--json] [--open]        list tasks (--open hides completed)
-tasks done <id>... | undo <id>... | toggle <id>... | rm <id>...
+tasks start <id>... [--by NAME]   mark in progress ("doing"), claimed by NAME
+tasks done <id>... | undo <id>... back to todo | rm <id>...
+tasks move <id>... <todo|doing|done> [--by NAME]
+tasks next <id>... | prev <id>... step one column right / left
+tasks toggle <id>...              done <-> todo
 tasks clear [--all]               drop completed tasks (or everything with --all)
 tasks path                        print the backing file
-tasks config [ephemeral true|false]
+tasks config [<key> <value>]      ephemeral true|false, view list|kanban
 ```
 
-`tasks ls --json` returns an array of
-`{id, text, done, by, created, doneAt}`. IDs are integers and are never reused,
-so an agent holding an old ID can't tick off a different task.
+Every task has a status: `todo`, `doing`, or `done`. `tasks ls --json` returns
+an array of `{id, text, status, done, by, created, startedBy, startedAt, doneAt}`,
+where `done` is just `status == "done"`, kept for simple readers. IDs are
+integers and are never reused, so an agent holding an old ID can't tick off a
+different task.
+
+`tasks start` records who picked a task up, and the panel shows it
+(`doing: claude`). Agents can check for that before starting work, so two of
+them don't take the same task.
 
 Every write goes through the CLI under a file lock, so the panel and any number of
 agents can use the list at once. The panel uses the same CLI, and watches the
 file to pick up changes made elsewhere.
+
+## List or kanban view
+
+```bash
+tasks config view kanban   # Todo / Doing / Done columns
+tasks config view list     # the default checklist
+```
+
+The panel switches right away. In the list view, a task in progress shows a
+half-filled checkbox and `doing`. Clicking a task ticks it done (or back to
+todo), and right-clicking steps it back one stage. The CLI works the same in
+both views.
 
 ## Persistent or per-session
 
@@ -66,8 +92,9 @@ that's still open, or lingering enabled for your user, keeps it alive.
 Switching modes doesn't move tasks: each mode has its own list, and the bar
 follows the switch automatically.
 
-The setting is stored in `~/.config/tasks/config` as `ephemeral=true|false`.
-Environment variables override it for a single command: `TASKS_EPHEMERAL=1`, or
+Settings are stored in `~/.config/tasks/config` as `key=value` lines
+(`ephemeral=true`, `view=kanban`). Environment variables override them for a
+single command: `TASKS_EPHEMERAL=1`, `TASKS_VIEW=kanban`, or
 `TASKS_FILE=/path/to/list.json` to use a specific file.
 
 ## Telling your agents about it
@@ -82,8 +109,9 @@ can paste into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
 The user has a task list in the desktop bar that they and every agent share.
 Use the `tasks` CLI; never edit its JSON file directly.
 
-    tasks add --by <your-name> "text"   # prints the new id
-    tasks ls --json                     # read the list (--open: hide done)
+    tasks add --by <your-name> "text"     # prints the new id
+    tasks ls --json                       # read the list (--open: hide done)
+    tasks start <id> --by <your-name>     # claim a task you're working on
     tasks done <id> | undo <id> | rm <id>
 
 Use it for things that should outlive this conversation or need the user's
@@ -91,9 +119,10 @@ hands: a step only they can do (a login, a hardware action, an approval), a
 follow-up you found but are not doing now, or a pointer to results waiting for
 them. Keep each task one short line that makes sense without this chat.
 
-Do not mirror your internal step-by-step plan into it. Mark tasks you add done
-when you finish them, and leave the user's own tasks (`by: human`) alone unless
-asked.
+Before working on a listed task, check it isn't already `doing` under another
+agent's name, then claim it with `tasks start`. Do not mirror your internal
+step-by-step plan into it. Mark tasks you add or claim done when you finish
+them, and leave the user's own tasks (`by: human`) alone unless asked.
 ```
 
 ## Notes
